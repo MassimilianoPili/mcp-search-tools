@@ -81,9 +81,9 @@ public class WebSearchTools {
         String korePrefix = "";
         if (semanticLookup != null && semanticLookup.isAvailable()) {
             try {
-                String koreResults = semanticLookup.search(query, 3);
+                String koreResults = semanticLookup.searchWithGraphExpansion(query, 3, 1);
                 if (koreResults != null) {
-                    korePrefix = "--- From KORE (cached knowledge) ---\n" + koreResults + "\n--- Web results ---\n";
+                    korePrefix = "--- From KORE (cached knowledge + graph context) ---\n" + koreResults + "\n--- Web results ---\n";
                 }
             } catch (Exception e) {
                 log.debug("Semantic lookup skipped for '{}': {}", query, e.getMessage());
