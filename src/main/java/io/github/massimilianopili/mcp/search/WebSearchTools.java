@@ -86,19 +86,21 @@ public class WebSearchTools {
         String cats = (categories != null && !categories.isBlank()) ? categories : "general";
         String lang = (language != null && !language.isBlank()) ? language : "auto";
 
-        // KORE lookup: async with 5s timeout, never blocks SearXNG
-        Mono<String> koreMono = Mono.empty();
+        // KORE lookup: fire-and-forget in parallel, never delays SearXNG
+        Mono<String> koreCached = Mono.<String>empty().cache();
         if (semanticLookup != null && semanticLookup.isAvailable()) {
-            koreMono = Mono.fromCallable(() -> semanticLookup.searchWithGraphExpansion(query, 3, 1))
+            koreCached = Mono.fromCallable(() -> semanticLookup.searchWithGraphExpansion(query, 3, 1))
                     .subscribeOn(Schedulers.boundedElastic())
-                    .timeout(Duration.ofSeconds(5))
                     .onErrorResume(e -> {
                         log.debug("Semantic lookup skipped for '{}': {}", query, e.getMessage());
                         return Mono.empty();
-                    });
+                    })
+                    .cache(); // cache result, subscribe eagerly below
         }
+        final Mono<String> kore = koreCached;
+        kore.subscribe(); // start KORE immediately (non-blocking)
 
-        Mono<String> searxngMono = searxngClient.get()
+        return searxngClient.get()
                 .uri(uriBuilder -> uriBuilder
                         .path("/search")
                         .queryParam("q", query)
@@ -107,18 +109,13 @@ public class WebSearchTools {
                         .queryParam("language", lang)
                         .build())
                 .retrieve()
-                .bodyToMono(String.class);
-
-        // Run KORE and SearXNG in parallel, combine results
-        return Mono.zip(
-                        koreMono.defaultIfEmpty(""),
-                        searxngMono)
-                .map(tuple -> {
-                    String kore = tuple.getT1();
-                    String web = tuple.getT2();
-                    if (kore.isEmpty()) return web;
-                    return "--- From KORE (cached knowledge + graph context) ---\n" + kore + "\n--- Web results ---\n" + web;
-                })
+                .bodyToMono(String.class)
+                .flatMap(web -> kore
+                        .timeout(Duration.ofSeconds(2)) // max 2s grace after SearXNG ready
+                        .defaultIfEmpty("")
+                        .onErrorReturn("")
+                        .map(k -> k.isEmpty() ? web
+                                : "--- From KORE (cached knowledge + graph context) ---\n" + k + "\n--- Web results ---\n" + web))
                 .timeout(requestTimeout)
                 .onErrorResume(e -> Mono.just(
                         "{\"error\": \"Web search for '" + query + "': " + e.getMessage() + "\"}"));
