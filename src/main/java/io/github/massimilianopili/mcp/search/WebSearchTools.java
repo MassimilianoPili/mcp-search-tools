@@ -25,7 +25,6 @@ import java.util.Map;
 public class WebSearchTools {
 
     private static final Logger log = LoggerFactory.getLogger(WebSearchTools.class);
-    private static final Duration FETCH_TIMEOUT = Duration.ofSeconds(30);
     private static final int MAX_RETRIES = 3;
 
     private static final Map<String, String> ACADEMIC_API_QUERY_PARAMS = Map.of(
@@ -37,6 +36,9 @@ public class WebSearchTools {
 
     private final WebClient searxngClient;
     private final WebClient httpClient;
+    private final Duration chainTimeout;
+    private final Duration requestTimeout;
+    private final HostCircuitBreaker circuitBreaker;
 
     @Autowired(required = false)
     private ChunkStore chunkStore;
@@ -55,9 +57,15 @@ public class WebSearchTools {
 
     public WebSearchTools(
             @Qualifier("searxngWebClient") WebClient searxngClient,
-            @Qualifier("searchHttpClient") WebClient httpClient) {
+            @Qualifier("searchHttpClient") WebClient httpClient,
+            SearchConfig searchConfig) {
         this.searxngClient = searxngClient;
         this.httpClient = httpClient;
+        this.chainTimeout = searchConfig.getChainTimeout();
+        this.requestTimeout = searchConfig.getRequestTimeout();
+        this.circuitBreaker = new HostCircuitBreaker(
+                searchConfig.getCircuitBreakerThreshold(),
+                searchConfig.getCircuitBreakerOpenDuration());
     }
 
     @ReactiveTool(
@@ -101,8 +109,8 @@ public class WebSearchTools {
                         .build())
                 .retrieve()
                 .bodyToMono(String.class)
-                .timeout(FETCH_TIMEOUT)
                 .map(result -> prefix.isEmpty() ? result : prefix + result)
+                .timeout(chainTimeout)
                 .onErrorResume(e -> Mono.just(
                         (prefix.isEmpty() ? "" : prefix) +
                         "{\"error\": \"Web search for '" + query + "': " + e.getMessage() + "\"}"));
@@ -136,31 +144,36 @@ public class WebSearchTools {
             }
         }
 
+        String host = extractHost(url);
+
+        // Circuit breaker: if host is rate-limited, skip directly to fallback
+        if (circuitBreaker.isOpen(host)) {
+            log.info("web_fetch circuit open for '{}', skipping to fallback", host);
+            return handleFallback(url, extract, null);
+        }
+
         return httpClient.get()
                 .uri(url)
                 .retrieve()
                 .bodyToMono(String.class)
-                .timeout(FETCH_TIMEOUT)
+                .doOnNext(body -> circuitBreaker.recordSuccess(host))
+                // Only retry on 5xx and connectivity errors, NOT 429 (rate limits)
                 .retryWhen(Retry.backoff(MAX_RETRIES, Duration.ofSeconds(2))
                         .maxBackoff(Duration.ofSeconds(10))
                         .jitter(0.3)
-                        .filter(WebSearchTools::isRetryable)
+                        .filter(WebSearchTools::isRetryableServerError)
                         .doBeforeRetry(s -> log.warn("web_fetch retry #{} for '{}': {}",
                                 s.totalRetries() + 1, url, s.failure().getMessage())))
+                .timeout(requestTimeout.dividedBy(2)) // cap HTTP+retries (15s default)
                 .flatMap(body -> processResponse(body, url, extract))
                 .onErrorResume(e -> {
                     log.error("web_fetch failed for '{}': {}", url, e.getMessage());
-                    String scienceQuery = extractAcademicQuery(url);
-                    if (scienceQuery != null && is429(e)) {
-                        log.info("web_fetch fallback SearXNG science for '{}'", scienceQuery);
-                        return webSearch(scienceQuery, 10, "science", "en")
-                                .flatMap(body -> processResponse(body, url, null));
+                    if (is429(e)) {
+                        circuitBreaker.record429(host);
                     }
-                    if (shouldFallbackToBrowser(e)) {
-                        return fetchWithBrowser(url, extract);
-                    }
-                    return Mono.just("{\"error\": \"Fetch failed for '" + url + "': " + e.getMessage() + "\"}");
-                });
+                    return handleFallback(url, extract, e);
+                })
+                .timeout(requestTimeout); // cap entire chain including fallback (30s default)
     }
 
     @ReactiveTool(
@@ -181,10 +194,10 @@ public class WebSearchTools {
 
     // --- Fallback helpers ---
 
-    private static boolean isRetryable(Throwable t) {
+    private static boolean isRetryableServerError(Throwable t) {
         if (t instanceof WebClientResponseException wcre) {
             int status = wcre.getStatusCode().value();
-            return status == 429 || status >= 500;
+            return status >= 500; // only 5xx, NOT 429
         }
         return t instanceof java.util.concurrent.TimeoutException
                 || t instanceof java.net.ConnectException;
@@ -203,6 +216,31 @@ public class WebSearchTools {
             return status == 429 || status == 403;
         }
         return false;
+    }
+
+    private Mono<String> handleFallback(String url, String extract, Throwable cause) {
+        String scienceQuery = extractAcademicQuery(url);
+        if (scienceQuery != null && (cause == null || is429(cause))) {
+            log.info("web_fetch fallback SearXNG science for '{}'", scienceQuery);
+            return webSearch(scienceQuery, 10, "science", "en")
+                    .flatMap(body -> processResponse(body, url, null));
+        }
+        if (cause != null && shouldFallbackToBrowser(cause)) {
+            return fetchWithBrowser(url, extract);
+        }
+        if (cause == null && headlessBrowser != null && headlessBrowser.isAvailable()) {
+            return fetchWithBrowser(url, extract);
+        }
+        String errorMsg = cause != null ? cause.getMessage() : "host rate-limited (circuit open)";
+        return Mono.just("{\"error\": \"Fetch failed for '" + url + "': " + errorMsg + "\"}");
+    }
+
+    private static String extractHost(String url) {
+        try {
+            return URI.create(url).getHost();
+        } catch (Exception e) {
+            return url;
+        }
     }
 
     private static String extractAcademicQuery(String url) {
@@ -230,7 +268,7 @@ public class WebSearchTools {
         }
         return Mono.fromCallable(() -> {
                     log.info("web_fetch fallback browser for '{}'", url);
-                    return headlessBrowser.fetchPageContent(url, FETCH_TIMEOUT.toMillis());
+                    return headlessBrowser.fetchPageContent(url, chainTimeout.toMillis());
                 })
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(body -> processResponse(body, url, extract))
