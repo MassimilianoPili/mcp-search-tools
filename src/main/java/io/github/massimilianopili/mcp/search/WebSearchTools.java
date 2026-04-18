@@ -86,20 +86,19 @@ public class WebSearchTools {
         String cats = (categories != null && !categories.isBlank()) ? categories : "general";
         String lang = (language != null && !language.isBlank()) ? language : "auto";
 
-        String korePrefix = "";
+        // KORE lookup: async with 5s timeout, never blocks SearXNG
+        Mono<String> koreMono = Mono.empty();
         if (semanticLookup != null && semanticLookup.isAvailable()) {
-            try {
-                String koreResults = semanticLookup.searchWithGraphExpansion(query, 3, 1);
-                if (koreResults != null) {
-                    korePrefix = "--- From KORE (cached knowledge + graph context) ---\n" + koreResults + "\n--- Web results ---\n";
-                }
-            } catch (Exception e) {
-                log.debug("Semantic lookup skipped for '{}': {}", query, e.getMessage());
-            }
+            koreMono = Mono.fromCallable(() -> semanticLookup.searchWithGraphExpansion(query, 3, 1))
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .timeout(Duration.ofSeconds(5))
+                    .onErrorResume(e -> {
+                        log.debug("Semantic lookup skipped for '{}': {}", query, e.getMessage());
+                        return Mono.empty();
+                    });
         }
-        final String prefix = korePrefix;
 
-        return searxngClient.get()
+        Mono<String> searxngMono = searxngClient.get()
                 .uri(uriBuilder -> uriBuilder
                         .path("/search")
                         .queryParam("q", query)
@@ -108,11 +107,20 @@ public class WebSearchTools {
                         .queryParam("language", lang)
                         .build())
                 .retrieve()
-                .bodyToMono(String.class)
-                .map(result -> prefix.isEmpty() ? result : prefix + result)
-                .timeout(chainTimeout)
+                .bodyToMono(String.class);
+
+        // Run KORE and SearXNG in parallel, combine results
+        return Mono.zip(
+                        koreMono.defaultIfEmpty(""),
+                        searxngMono)
+                .map(tuple -> {
+                    String kore = tuple.getT1();
+                    String web = tuple.getT2();
+                    if (kore.isEmpty()) return web;
+                    return "--- From KORE (cached knowledge + graph context) ---\n" + kore + "\n--- Web results ---\n" + web;
+                })
+                .timeout(requestTimeout)
                 .onErrorResume(e -> Mono.just(
-                        (prefix.isEmpty() ? "" : prefix) +
                         "{\"error\": \"Web search for '" + query + "': " + e.getMessage() + "\"}"));
     }
 
